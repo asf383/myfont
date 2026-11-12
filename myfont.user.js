@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Global Font Override (MyFont)
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.2
 // @description  Apply MyFont to all websites on Safari iOS, including CSP-locked sites like X. Energy-tuned.
 // @author       asf383
 // @match        *://*/*
@@ -60,6 +60,15 @@
 
     // After this many ms of no new shadow roots, disconnect observers.
     const IDLE_DISCONNECT_MS = 30000;
+
+    // On these sites the part we care about (the video player, with its
+    // subtitles) lives in a shadow root that can appear minutes after the
+    // page loaded, long after the normal watchers have gone idle. Here a
+    // light rescan keeps running every few seconds while the tab is visible.
+    const ALWAYS_WATCH_HOSTS = ['disneyplus.com'];
+    const ALWAYS_WATCH = ALWAYS_WATCH_HOSTS.some(
+        d => currentHost === d || currentHost.endsWith('.' + d));
+    const ALWAYS_WATCH_INTERVAL_MS = 3000;
 
     // Sites that declare these font-family names will be remapped to MyFont
     // by shadowing their @font-face declarations.
@@ -134,63 +143,97 @@
     }
 
     // ===== CSS construction ===========================================
-    function buildCSS() {
-        let css = '';
-        if (!FONTS_VIA_API) {
+    // Elements we must never touch, so the site's own font-family
+    // (icon fonts etc.) stays in effect.
+    const EXCLUDE = [
+        '[class*="icon"]', '[class*="Icon"]',
+        '[class*="sprite"]', '[class*="Sprite"]',
+        '.fa', '[class^="fa-"]', '[class*=" fa-"]',
+        '.fas', '.far', '.fab', '.fal', '.fad',
+        '.glyphicon', '.bi',
+        '[class*="material-icons"]', '[class*="material-symbols"]',
+        'svg', 'svg *',
+        '[role="img"]',
+        '[class*="PlayerControls"]', '[class*="player-controls"]',
+        '[class*="VideoControls"]', '[class*="video-controls"]',
+        '[class*="watch-video"]', '[class*="nf-player"]',
+        '.watch-video--player-view', '.sizing-wrapper',
+        '[class*="Emoji"]:not([class*="Text"])',
+        '[class*="emoji"]:not([class*="text"])',
+        '[aria-hidden="true"]',
+        '[data-visualcompletion="ignore"]',
+        '[data-visualcompletion="css-img"]',
+    ].join(', ');
+
+    // Subtitle containers drawn by web players (Disney+ uses
+    // dss-subtitle-renderer-* and hive-subtitle-renderer-*). These are
+    // always text, so they get the font regardless of the exclusions.
+    const SUBTITLE = [
+        '[class*="subtitle-renderer"]',
+        '[class*="subtitle-renderer"] *',
+    ].join(', ');
+
+    function fontFaceCSS() {
+        if (FONTS_VIA_API) return '';
+        let css = `
+            @font-face {
+                font-family: 'MyFont';
+                src: url('${FONT_URL}') format('woff2');
+                unicode-range: ${MYFONT_RANGE};
+                font-display: swap;
+            }
+        `;
+        for (let i = 0; i < SHADOWED_FONTS.length; i++) {
             css += `
                 @font-face {
-                    font-family: 'MyFont';
+                    font-family: '${SHADOWED_FONTS[i]}';
                     src: url('${FONT_URL}') format('woff2');
+                    font-weight: 100 900;
                     unicode-range: ${MYFONT_RANGE};
                     font-display: swap;
                 }
             `;
-            for (let i = 0; i < SHADOWED_FONTS.length; i++) {
-                css += `
-                    @font-face {
-                        font-family: '${SHADOWED_FONTS[i]}';
-                        src: url('${FONT_URL}') format('woff2');
-                        font-weight: 100 900;
-                        unicode-range: ${MYFONT_RANGE};
-                        font-display: swap;
-                    }
-                `;
-            }
         }
-        // Elements we must never touch, so the site's own font-family
-        // (icon fonts etc.) stays in effect.
-        const EXCLUDE = [
-            '[class*="icon"]', '[class*="Icon"]',
-            '[class*="sprite"]', '[class*="Sprite"]',
-            '.fa', '[class^="fa-"]', '[class*=" fa-"]',
-            '.fas', '.far', '.fab', '.fal', '.fad',
-            '.glyphicon', '.bi',
-            '[class*="material-icons"]', '[class*="material-symbols"]',
-            'svg', 'svg *',
-            '[role="img"]',
-            '[class*="PlayerControls"]', '[class*="player-controls"]',
-            '[class*="VideoControls"]', '[class*="video-controls"]',
-            '[class*="watch-video"]', '[class*="nf-player"]',
-            '.watch-video--player-view', '.sizing-wrapper',
-            '[class*="Emoji"]:not([class*="Text"])',
-            '[class*="emoji"]:not([class*="text"])',
-            '[aria-hidden="true"]',
-            '[data-visualcompletion="ignore"]',
-            '[data-visualcompletion="css-img"]',
-        ].join(', ');
+        return css;
+    }
 
-        css += `
+    // Rules shared by the document and by shadow roots.
+    function commonRules() {
+        const stack = fontStack();
+        return `
+            ${SUBTITLE} {
+                font-family: ${stack} !important;
+            }
+            video::cue {
+                font-family: ${stack} !important;
+            }
+        `;
+    }
+
+    // CSS for the main document.
+    function buildCSS() {
+        return fontFaceCSS() + `
             html body,
             html body *:not(${EXCLUDE}) {
                 font-family: ${fontStack()} !important;
             }
-        `;
-        return css;
+        ` + commonRules();
     }
 
-    // Build the CSS string exactly once and freeze it.
+    // CSS for shadow roots. A stylesheet inside a shadow root can only
+    // match elements inside that root, so "html body *" matches nothing
+    // there. Shadow roots need their own selector without html/body.
+    function buildShadowCSS() {
+        return `
+            *:not(${EXCLUDE}) {
+                font-family: ${fontStack()} !important;
+            }
+        ` + commonRules();
+    }
+
     siteFamilies = collectSiteFamilies();
     let CSS_TEXT = buildCSS();
+    let SHADOW_CSS_TEXT = buildShadowCSS();
     const shadowStyleEls = new Set();
 
     // Try to construct a single shared CSSStyleSheet. If supported, every
@@ -198,6 +241,7 @@
     // own copy of the CSS text in a <style> element. Big memory win on
     // pages with many custom elements.
     let sharedSheet = null;
+    let sharedShadowSheet = null;
     let canUseConstructable = false;
     try {
         if (typeof CSSStyleSheet === 'function' &&
@@ -205,11 +249,14 @@
             'adoptedStyleSheets' in Document.prototype) {
             sharedSheet = new CSSStyleSheet();
             sharedSheet.replaceSync(CSS_TEXT);
+            sharedShadowSheet = new CSSStyleSheet();
+            sharedShadowSheet.replaceSync(SHADOW_CSS_TEXT);
             canUseConstructable = true;
         }
     } catch (_) {
         // Older Safari throws here. Falls back to <style>-per-root.
         sharedSheet = null;
+        sharedShadowSheet = null;
         canUseConstructable = false;
     }
 
@@ -222,6 +269,7 @@
     function injectMainStyle() {
         // If our <style> is already last in <head>, nothing to do.
         const head = document.head || document.documentElement;
+        if (!head) return;   // too early: retried on DOMContentLoaded
         const existing = document.getElementById(STYLE_ID);
         if (existing && existing.parentNode === head && existing === head.lastElementChild) {
             return;
@@ -255,13 +303,17 @@
             next.every((f, i) => f === siteFamilies[i])) return;
         siteFamilies = next;
         CSS_TEXT = buildCSS();
+        SHADOW_CSS_TEXT = buildShadowCSS();
         const el = document.getElementById(STYLE_ID);
         if (el) el.textContent = CSS_TEXT;
         if (sharedSheet) {
             try { sharedSheet.replaceSync(CSS_TEXT); } catch (_) { /* ignore */ }
         }
+        if (sharedShadowSheet) {
+            try { sharedShadowSheet.replaceSync(SHADOW_CSS_TEXT); } catch (_) { /* ignore */ }
+        }
         shadowStyleEls.forEach((s) => {
-            if (s.isConnected) s.textContent = CSS_TEXT;
+            if (s.isConnected) s.textContent = SHADOW_CSS_TEXT;
             else shadowStyleEls.delete(s);
         });
     }
@@ -333,7 +385,10 @@
     if (document.head) {
         startHeadObserver();
     } else {
-        document.addEventListener('DOMContentLoaded', startHeadObserver, { once: true });
+        document.addEventListener('DOMContentLoaded', () => {
+            injectMainStyle();
+            startHeadObserver();
+        }, { once: true });
     }
 
     // ===== Shadow-DOM injection =======================================
@@ -346,23 +401,46 @@
     function attachToShadowRoot(root) {
         if (!root || seenShadowRoots.has(root)) return;
         seenShadowRoots.add(root);
-        try {
-            if (canUseConstructable && 'adoptedStyleSheets' in root) {
+        if (canUseConstructable && 'adoptedStyleSheets' in root) {
+            try {
                 // Append, don't replace, to avoid stomping on the
                 // component's own styles.
-                root.adoptedStyleSheets = [...root.adoptedStyleSheets, sharedSheet];
+                root.adoptedStyleSheets = [...root.adoptedStyleSheets, sharedShadowSheet];
                 return;
+            } catch (_) {
+                // Fall through to the <style> fallback below.
             }
-            // Fallback: <style>-per-root.
+        }
+        try {
             if (root.querySelector && root.querySelector(`style[${SHADOW_STYLE_MARK}]`)) return;
             const style = document.createElement('style');
             style.setAttribute(SHADOW_STYLE_MARK, '');
-            style.textContent = CSS_TEXT;
+            style.textContent = SHADOW_CSS_TEXT;
             root.appendChild(style);
             shadowStyleEls.add(style);
         } catch (_) {
-            // Closed root or detached node — silently skip.
+            // Detached node — silently skip.
         }
+    }
+
+    // Check one element: if it hosts an (open) shadow root, style that
+    // root and look inside it for nested shadow roots as well.
+    function checkHost(el) {
+        const ln = el.localName;
+        // localName comparison is the fastest custom-element filter.
+        if (!ln || ln.indexOf('-') === -1) return 0;
+        const sr = el.shadowRoot;
+        if (!sr) return 0;
+        let found = 0;
+        if (!seenShadowRoots.has(sr)) {
+            attachToShadowRoot(sr);
+            found++;
+        }
+        // Always look inside, so nested roots added later are found on
+        // a rescan even when the outer root is already known.
+        const inner = sr.querySelectorAll('*');
+        for (let i = 0; i < inner.length; i++) found += checkHost(inner[i]);
+        return found;
     }
 
     // Scan a subtree for shadow roots, restricted to elements that could
@@ -371,30 +449,10 @@
     function scanSubtreeForShadowRoots(root) {
         if (!root || root.nodeType !== 1) return 0;
         if (root.tagName === 'SVG' || root.tagName === 'svg') return 0;
-        let found = 0;
-
-        // The root node itself
-        if (root.localName && root.localName.indexOf('-') !== -1 && root.shadowRoot) {
-            if (!seenShadowRoots.has(root.shadowRoot)) {
-                attachToShadowRoot(root.shadowRoot);
-                found++;
-            }
-        }
-
-        // Descendants — use getElementsByTagName for a live, cheap iteration
+        let found = checkHost(root);
         if (!root.getElementsByTagName) return found;
         const all = root.getElementsByTagName('*');
-        for (let i = 0; i < all.length; i++) {
-            const el = all[i];
-            // localName comparison is the fastest custom-element filter.
-            const ln = el.localName;
-            if (!ln || ln.indexOf('-') === -1) continue;
-            const sr = el.shadowRoot;
-            if (sr && !seenShadowRoots.has(sr)) {
-                attachToShadowRoot(sr);
-                found++;
-            }
-        }
+        for (let i = 0; i < all.length; i++) found += checkHost(all[i]);
         return found;
     }
 
@@ -524,6 +582,65 @@
         bootstrapShadow();
     }
 
+    // ===== Catch players that appear late =============================
+    // Single-page apps (Disney+ and others) create the video player only
+    // when playback starts, which can be long after the watchers above
+    // have gone idle. Two cheap safety nets:
+    //   1. When the address changes (navigating to a /play/ page), run
+    //      the scan again and restart the watchers for a fresh window.
+    //   2. On ALWAYS_WATCH_HOSTS, rescan every few seconds while visible.
+    function reviveShadowWatch() {
+        if (!document.body) return;
+        lastNewRootAt = Date.now();
+        injectMainStyle();
+        startHeadObserver();
+        scanSubtreeForShadowRoots(document.body);
+        startShadowObserver();
+        startIdleWatchdog();
+        // The shadow root is often attached a moment after its element.
+        [1000, 3000, 8000, 15000].forEach((ms) => {
+            setTimeout(() => {
+                if (!document.hidden && document.body) {
+                    if (scanSubtreeForShadowRoots(document.body) > 0) {
+                        lastNewRootAt = Date.now();
+                    }
+                }
+            }, ms);
+        });
+    }
+
+    let lastHref = window.location.href;
+    let watchTimer = null;
+    let lastAlwaysScan = 0;
+
+    function startLateWatch() {
+        if (watchTimer) return;
+        watchTimer = setInterval(() => {
+            const href = window.location.href;
+            if (href !== lastHref) {
+                lastHref = href;
+                reviveShadowWatch();
+                return;
+            }
+            if (ALWAYS_WATCH && document.body) {
+                const now = Date.now();
+                if (now - lastAlwaysScan >= ALWAYS_WATCH_INTERVAL_MS) {
+                    lastAlwaysScan = now;
+                    scanSubtreeForShadowRoots(document.body);
+                }
+            }
+        }, 1000);
+    }
+
+    function stopLateWatch() {
+        if (watchTimer) {
+            clearInterval(watchTimer);
+            watchTimer = null;
+        }
+    }
+
+    if (!document.hidden) startLateWatch();
+
     // ===== Visibility-aware pausing ===================================
     // When the tab is hidden, disconnect everything to save energy.
     // When it becomes visible again, do a one-shot scan to catch up.
@@ -531,7 +648,10 @@
         if (document.hidden) {
             stopShadowObserver();
             stopHeadObserver();
+            stopLateWatch();
         } else {
+            startLateWatch();
+            if (ALWAYS_WATCH && document.body) scanSubtreeForShadowRoots(document.body);
             // Page came back. Reassert main style and resume watchers
             // if the page seems active. Don't restart if we already
             // gave up due to long idle.

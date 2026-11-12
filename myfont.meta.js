@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Global Font Override (MyFont)
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.2
 // @description  Apply MyFont to all websites on Safari iOS, including CSP-locked sites like X. Energy-tuned.
 // @author       asf383
 // @match        *://*/*
